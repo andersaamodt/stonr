@@ -1,21 +1,36 @@
-# Tor Onion Deployment
 
-To expose Stonr's HTTP and WebSocket services via Tor hidden services, configure `torrc` with separate service directories:
+# Running stonr over Tor
 
-```conf
-HiddenServiceDir /var/lib/tor/stonr_ws/
+stonr can expose its HTTP and WebSocket interfaces as Tor hidden services.
+
+## torrc configuration
+
+Add this to your `torrc`:
+
+```
+HiddenServiceDir /var/lib/tor/stonr/
 HiddenServiceVersion 3
-HiddenServicePort 80 127.0.0.1:7778
-
-HiddenServiceDir /var/lib/tor/stonr_http/
-HiddenServiceVersion 3
-HiddenServicePort 80 127.0.0.1:7777
+HiddenServicePort 80 127.0.0.1:3000
+HiddenServicePort 443 127.0.0.1:3001
 ```
 
-With Tor running, set the `TOR_SOCKS` environment variable so Stonr uses the proxy for upstream siphoning:
+Restart `tor`. The generated hostname will be placed in the `HiddenServiceDir`.
+
+## Binding stonr services
+
+stonr reads several environment variables to bind its services:
+
+- `BIND_HTTP` – HTTP listening address (default `127.0.0.1:3000`)
+- `BIND_WS` – WebSocket listening address (default `127.0.0.1:3001`)
+- `TOR_SOCKS` – Tor SOCKS proxy address (default `127.0.0.1:9050`)
+
+Run `stonr` with these variables set to match the ports configured in `torrc`:
 
 ```bash
-TOR_SOCKS=127.0.0.1:9050
+BIND_HTTP=127.0.0.1:3000 \
+BIND_WS=127.0.0.1:3001 \
+TOR_SOCKS=127.0.0.1:9050 \
+stonr
 ```
 
-`BIND_HTTP` and `BIND_WS` must match the ports referenced in the `HiddenServicePort` directives.
+Now stonr will accept connections from Tor via the hidden service.
