@@ -37,4 +37,8 @@ cargo test
 cargo tarpaulin --timeout 120 --out Lcov
 ```
 
+The ports above are examples; when running behind Tor the [onion guide](docs/onion.md)
+uses `3000/3001` to match the `torrc` example. Choose values that align across
+your configuration.
+
 See [docs/onion.md](docs/onion.md) for Tor deployment details.

@@ -39,6 +39,12 @@ async fn handler(ws: WebSocketUpgrade, State(store): State<Arc<Store>>) -> impl 
 }
 
 /// Process incoming REQ/CLOSE messages on a WebSocket connection.
+///
+/// The relay expects NIP-01-style arrays where the first element is a command
+/// string (e.g. `REQ` to subscribe or `CLOSE` to cancel). For each `REQ`, the
+/// third array element is a Nostr filter object which we convert into a `Query`
+/// and feed to the store. Matching events are sent back as `EVENT` messages
+/// followed by an `EOSE` marker.
 async fn process(mut socket: WebSocket, store: Arc<Store>) {
     while let Some(Ok(msg)) = socket.next().await {
         if let Message::Text(txt) = msg {
@@ -48,7 +54,7 @@ async fn process(mut socket: WebSocket, store: Arc<Store>) {
                         Some("REQ") if arr.len() >= 3 => {
                             let sub = arr[1].as_str().unwrap_or_default().to_string();
                             let filt = arr[2].clone();
-                            let q = parse_filter(filt);
+                            let q = Query::from_value(&filt);
                             if let Ok(events) = store.query(q) {
                                 for ev in events {
                                     let msg = serde_json::json!(["EVENT", sub, ev]);
@@ -69,47 +75,6 @@ async fn process(mut socket: WebSocket, store: Arc<Store>) {
     }
 }
 
-/// Convert a Nostr filter JSON value into a `Query`.
-fn parse_filter(val: Value) -> Query {
-    let authors = val.get("authors").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect()
-    });
-    let kinds = val.get("kinds").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_u64().map(|u| u as u32))
-            .collect()
-    });
-    let d = val
-        .get("#d")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.get(0))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let t = val
-        .get("#t")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.get(0))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let since = val.get("since").and_then(|v| v.as_u64());
-    let until = val.get("until").and_then(|v| v.as_u64());
-    let limit = val
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-    Query {
-        authors,
-        kinds,
-        d,
-        t,
-        since,
-        until,
-        limit,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +84,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
 
     #[test]
-    fn parse_filter_fields() {
+    fn from_value_fields() {
         let val = serde_json::json!({
             "authors": ["a1", "a2"],
             "kinds": [1, 2],
@@ -129,7 +94,7 @@ mod tests {
             "until": 2,
             "limit": 3
         });
-        let q = super::parse_filter(val);
+        let q = Query::from_value(&val);
         assert_eq!(q.authors.unwrap(), vec!["a1".to_string(), "a2".to_string()]);
         assert_eq!(q.kinds.unwrap(), vec![1, 2]);
         assert_eq!(q.d.unwrap(), "slug");
@@ -140,8 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_filter_defaults() {
-        let q = super::parse_filter(serde_json::json!({}));
+    fn from_value_defaults() {
+        let q = Query::from_value(&serde_json::json!({}));
         assert!(q.authors.is_none());
         assert!(q.kinds.is_none());
         assert!(q.d.is_none());

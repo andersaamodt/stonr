@@ -73,25 +73,49 @@ struct QueryParams {
     limit: Option<String>,
 }
 
+/// Convert query string parameters into a [`Query`] understood by the store.
+fn params_to_query(params: QueryParams) -> Query {
+    use serde_json::Value;
+    let mut obj = serde_json::Map::new();
+    if let Some(a) = params.authors {
+        let arr = a.split(',').map(|s| Value::String(s.to_string())).collect();
+        obj.insert("authors".into(), Value::Array(arr));
+    }
+    if let Some(k) = params.kinds {
+        let arr = k
+            .split(',')
+            .filter_map(|v| v.parse::<u32>().ok())
+            .map(|v| Value::Number(v.into()))
+            .collect();
+        obj.insert("kinds".into(), Value::Array(arr));
+    }
+    if let Some(d) = params.d {
+        obj.insert("#d".into(), Value::Array(vec![Value::String(d)]));
+    }
+    if let Some(t) = params.t {
+        obj.insert("#t".into(), Value::Array(vec![Value::String(t)]));
+    }
+    if let Some(s) = params.since.and_then(|v| v.parse::<u64>().ok()) {
+        obj.insert("since".into(), Value::Number(s.into()));
+    }
+    if let Some(u) = params.until.and_then(|v| v.parse::<u64>().ok()) {
+        obj.insert("until".into(), Value::Number(u.into()));
+    }
+    if let Some(l) = params.limit.and_then(|v| v.parse::<u64>().ok()) {
+        obj.insert("limit".into(), Value::Number(l.into()));
+    }
+    Query::from_value(&Value::Object(obj))
+}
+
 /// Parse query parameters and return matching events as NDJSON.
 async fn query(
     State(store): State<Arc<Store>>,
     AxumQuery(params): AxumQuery<QueryParams>,
 ) -> axum::response::Response {
-    let q = Query {
-        authors: params
-            .authors
-            .map(|s| s.split(',').map(|s| s.to_string()).collect()),
-        kinds: params
-            .kinds
-            .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect()),
-        d: params.d,
-        t: params.t,
-        since: params.since.as_deref().and_then(|v| v.parse().ok()),
-        until: params.until.as_deref().and_then(|v| v.parse().ok()),
-        limit: params.limit.as_deref().and_then(|v| v.parse().ok()),
-    };
+    // Translate URL parameters into a `Query` structure shared with the WS API.
+    let q = params_to_query(params);
     let events = store.query(q).unwrap_or_default();
+    // Return newline-delimited JSON so clients can stream and parse incrementally.
     let body = events
         .into_iter()
         .map(|e| serde_json::to_string(&e).unwrap())
