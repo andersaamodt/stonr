@@ -34,10 +34,13 @@ pub async fn run(cfg: Settings, store: Store) {
 
 /// Connect to a relay, subscribe, and persist received events.
 async fn siphon_relay(relay: String, cfg: Settings, store: Store) -> Result<()> {
+    // Determine the starting timestamp either from a stored cursor or a fixed
+    // configuration value.
     let since = match cfg.filter_since_mode {
         SinceMode::Cursor => read_cursor(&cfg.store_root, &relay).unwrap_or(0),
         SinceMode::Fixed(ts) => ts,
     };
+    // Assemble the filter sent in the REQ message based on config options.
     let mut filter = serde_json::Map::new();
     if let Some(a) = cfg.filter_authors.clone() {
         filter.insert(
@@ -61,9 +64,12 @@ async fn siphon_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
         filter.insert("since".into(), Value::Number(since.into()));
     }
     let req = json!(["REQ", "siphon", Value::Object(filter)]);
+    // Open the WebSocket (optionally through Tor) and send the subscription.
     let mut ws = connect_ws(&relay, cfg.tor_socks.as_deref()).await?;
     ws.send(Message::Text(req.to_string())).await?;
     let mut latest = since;
+    // Consume messages until EOSE, persisting each event and tracking the
+    // newest timestamp seen.
     while let Some(msg) = ws.next().await {
         match msg? {
             Message::Text(txt) => {
@@ -88,11 +94,14 @@ async fn siphon_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
             _ => {}
         }
     }
+    // Persist the cursor so the next run resumes from where we left off.
     write_cursor(&cfg.store_root, &relay, latest)?;
     Ok(())
 }
 
-/// Establish a WebSocket connection, optionally via a SOCKS5 proxy.
+/// Establish a WebSocket connection, optionally via a SOCKS5 proxy. When
+/// `tor_socks` is provided, the TCP connection is tunneled through the proxy
+/// before performing the WebSocket handshake.
 async fn connect_ws(
     relay: &str,
     tor_socks: Option<&str>,

@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use hex;
 use rand::{seq::SliceRandom, thread_rng};
 use secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
-use serde_json::to_writer;
+use serde_json::{to_writer, Value};
 use sha2::{Digest, Sha256};
 
 use crate::event::{Event, Tag};
@@ -51,13 +51,16 @@ impl Store {
 
     /// Ingest an event if it doesn't already exist on disk.
     pub fn ingest(&self, ev: &Event) -> Result<()> {
+        // Optionally verify the event's Schnorr signature before writing.
         if self.verify_sig {
             verify_event(ev)?;
         }
+        // Skip ingest if the event already exists on disk.
         let path = self.event_path(&ev.id);
         if path.exists() {
             return Ok(());
         }
+        // Write the event JSON atomically to its canonical path.
         let parent_dir = path
             .parent()
             .map(|p| p.to_path_buf())
@@ -67,6 +70,7 @@ impl Store {
         to_writer(&tmp, ev)?;
         tmp.persist(&path)?;
 
+        // Append the event to a newline-delimited log for easy tailing.
         let log_path = self.root.join("log/events.ndjson");
         let mut log_file = fs::OpenOptions::new()
             .create(true)
@@ -75,6 +79,7 @@ impl Store {
         serde_json::to_writer(&mut log_file, ev)?;
         log_file.write_all(b"\n")?;
 
+        // Update lookup indexes and create mirror symlinks.
         self.index_event(ev)?;
         self.write_mirror_links(ev)
     }
@@ -206,24 +211,26 @@ impl Store {
             .join(format!("{}.json", id))
     }
 
+    /// Helper to load ID sets for a list of keys under `prefix`.
+    fn load_ids(&self, prefix: &str, keys: &[String]) -> Result<std::collections::HashSet<String>> {
+        let mut ids = std::collections::HashSet::new();
+        for key in keys {
+            let path = self.root.join(prefix).join(format!("{}.txt", key));
+            ids.extend(read_ids(&path)?);
+        }
+        Ok(ids)
+    }
+
     /// Execute a simple intersection-based query over indexes.
     pub fn query(&self, q: Query) -> Result<Vec<Event>> {
+        // Collect ID sets for each filter category and intersect them below.
         let mut sets: Vec<std::collections::HashSet<String>> = vec![];
         if let Some(authors) = q.authors {
-            let mut ids = std::collections::HashSet::new();
-            for a in authors {
-                let path = self.root.join("index/by-author").join(format!("{}.txt", a));
-                ids.extend(read_ids(&path)?);
-            }
-            sets.push(ids);
+            sets.push(self.load_ids("index/by-author", &authors)?);
         }
         if let Some(kinds) = q.kinds {
-            let mut ids = std::collections::HashSet::new();
-            for k in kinds {
-                let path = self.root.join("index/by-kind").join(format!("{}.txt", k));
-                ids.extend(read_ids(&path)?);
-            }
-            sets.push(ids);
+            let keys: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
+            sets.push(self.load_ids("index/by-kind", &keys)?);
         }
         if let Some(d) = q.d {
             let path = self.root.join("index/by-tag/d").join(format!("{}.txt", d));
@@ -237,11 +244,13 @@ impl Store {
             return Ok(vec![]);
         }
         let mut iter = sets.into_iter();
+        // Start with the first ID set and intersect each subsequent one.
         let mut ids = iter.next().unwrap();
         for s in iter {
             ids = ids.intersection(&s).cloned().collect();
         }
 
+        // Load matching events and apply time-based filters.
         let mut events: Vec<Event> = ids
             .into_iter()
             .filter_map(|id| {
@@ -298,6 +307,51 @@ pub struct Query {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: Option<usize>,
+}
+
+impl Query {
+    /// Build a `Query` from a Nostr filter JSON object used by HTTP and WS APIs.
+    pub fn from_value(val: &Value) -> Self {
+        // Parse optional arrays of authors and kinds.
+        let authors = val.get("authors").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+        let kinds = val.get("kinds").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|u| u as u32))
+                .collect()
+        });
+        // Tag-based queries use a one-element array for `#d`/`#t`.
+        let d = val
+            .get("#d")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.get(0))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let t = val
+            .get("#t")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.get(0))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let since = val.get("since").and_then(|v| v.as_u64());
+        let until = val.get("until").and_then(|v| v.as_u64());
+        let limit = val
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        Query {
+            authors,
+            kinds,
+            d,
+            t,
+            since,
+            until,
+            limit,
+        }
+    }
 }
 
 /// Recompute the Nostr event hash from its fields.

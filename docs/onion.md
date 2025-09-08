@@ -14,23 +14,31 @@ HiddenServicePort 80 127.0.0.1:3000
 HiddenServicePort 443 127.0.0.1:3001
 ```
 
-Restart `tor`. The generated hostname will be placed in the `HiddenServiceDir`.
+Restart `tor`. The generated onion hostname will be written to
+`HiddenServiceDir/hostname`.
 
 ## Binding stonr services
 
-stonr reads several environment variables to bind its services:
+stonr requires a few environment variables—none have built-in defaults:
 
-- `BIND_HTTP` – HTTP listening address (default `127.0.0.1:3000`)
-- `BIND_WS` – WebSocket listening address (default `127.0.0.1:3001`)
-- `TOR_SOCKS` – Tor SOCKS proxy address (default `127.0.0.1:9050`)
+- `STORE_ROOT` – directory to store events
+- `BIND_HTTP` – HTTP listening address
+- `BIND_WS` – WebSocket listening address
+- `TOR_SOCKS` – Tor SOCKS proxy address
 
-Run `stonr` with these variables set to match the ports configured in `torrc`:
+Create a `.env` file matching the ports in your `torrc`:
 
-```bash
-BIND_HTTP=127.0.0.1:3000 \
-BIND_WS=127.0.0.1:3001 \
-TOR_SOCKS=127.0.0.1:9050 \
-stonr
+```
+STORE_ROOT=/srv/stonr
+BIND_HTTP=127.0.0.1:3000
+BIND_WS=127.0.0.1:3001
+TOR_SOCKS=127.0.0.1:9050
 ```
 
-Now stonr will accept connections from Tor via the hidden service.
+Start the relay using this configuration:
+
+```bash
+stonr serve --env .env
+```
+
+stonr will now accept connections from Tor via the hidden service.
