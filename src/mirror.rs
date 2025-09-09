@@ -1,4 +1,4 @@
-//! Upstream relay siphon for mirroring events into the local store.
+//! Upstream relay mirroring for importing events into the local store.
 
 use std::path::PathBuf;
 
@@ -19,21 +19,31 @@ use crate::{
     storage::Store,
 };
 
-/// Spawn a siphon task for each configured upstream relay.
+/// Spawn a mirroring task for each configured upstream relay.
 pub async fn run(cfg: Settings, store: Store) {
     for relay in cfg.relays_upstream.clone() {
         let cfg_clone = cfg.clone();
         let store_clone = store.clone();
         tokio::spawn(async move {
-            if let Err(e) = siphon_relay(relay, cfg_clone, store_clone).await {
-                eprintln!("siphon error: {e}");
+            if let Err(e) = mirror_relay(relay, cfg_clone, store_clone).await {
+                eprintln!("mirror error: {e}");
             }
         });
     }
 }
 
 /// Connect to a relay, subscribe, and persist received events.
-async fn siphon_relay(relay: String, cfg: Settings, store: Store) -> Result<()> {
+///
+/// The mirroring workflow is:
+/// 1. Determine the starting timestamp (`since`) from a stored cursor or fixed
+///    configuration.
+/// 2. Build a Nostr filter and open a WebSocket connection to the upstream
+///    relay (optionally via Tor).
+/// 3. Send a `REQ` subscription and process incoming `EVENT` messages,
+///    updating the latest timestamp seen.
+/// 4. After receiving `EOSE`, write the cursor so the next run resumes from the
+///    newest event.
+async fn mirror_relay(relay: String, cfg: Settings, store: Store) -> Result<()> {
     // Determine the starting timestamp either from a stored cursor or a fixed
     // configuration value.
     let since = match cfg.filter_since_mode {
@@ -63,7 +73,7 @@ async fn siphon_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
     if since > 0 {
         filter.insert("since".into(), Value::Number(since.into()));
     }
-    let req = json!(["REQ", "siphon", Value::Object(filter)]);
+    let req = json!(["REQ", "mirror", Value::Object(filter)]);
     // Open the WebSocket (optionally through Tor) and send the subscription.
     let mut ws = connect_ws(&relay, cfg.tor_socks.as_deref()).await?;
     ws.send(Message::Text(req.to_string())).await?;
@@ -99,9 +109,12 @@ async fn siphon_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
     Ok(())
 }
 
-/// Establish a WebSocket connection, optionally via a SOCKS5 proxy. When
-/// `tor_socks` is provided, the TCP connection is tunneled through the proxy
-/// before performing the WebSocket handshake.
+/// Establish a WebSocket connection, optionally via a SOCKS5 proxy.
+///
+/// The underlying TCP stream may either be a direct `TcpStream` or a
+/// `Socks5Stream` when routing through Tor. To hide this difference the stream
+/// is boxed as a `dyn AsyncReadWrite`, allowing the caller to treat both cases
+/// uniformly. Any network or handshake errors bubble up to the caller.
 async fn connect_ws(
     relay: &str,
     tor_socks: Option<&str>,
@@ -122,10 +135,18 @@ async fn connect_ws(
 }
 
 /// Blanket trait for boxed async read/write streams.
+///
+/// `TcpStream` and `Socks5Stream` implement the standard `AsyncRead` and
+/// `AsyncWrite` traits but have different concrete types. Boxing them behind a
+/// trait object lets `connect_ws` return a single stream type regardless of how
+/// the connection was established.
 trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 /// Compute the cursor file path for a relay URL.
+///
+/// Each upstream relay gets a SHA1-hashed filename under `cursor/` so that
+/// timestamps persist across runs without leaking the relay URL itself.
 fn cursor_path(root: &PathBuf, relay: &str) -> PathBuf {
     let mut hasher = Sha1::new();
     hasher.update(relay.as_bytes());
@@ -134,12 +155,17 @@ fn cursor_path(root: &PathBuf, relay: &str) -> PathBuf {
 }
 
 /// Read the last seen timestamp for a relay.
+///
+/// Returns `None` if no cursor file exists or if the contents fail to parse.
 fn read_cursor(root: &PathBuf, relay: &str) -> Option<u64> {
     let path = cursor_path(root, relay);
     std::fs::read_to_string(path).ok()?.parse().ok()
 }
 
 /// Persist the last seen timestamp for a relay.
+///
+/// Any I/O error while creating directories or writing the file is returned
+/// to the caller.
 fn write_cursor(root: &PathBuf, relay: &str, ts: u64) -> Result<()> {
     let path = cursor_path(root, relay);
     if let Some(p) = path.parent() {
@@ -160,7 +186,7 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message as TMsg};
 
     #[tokio::test]
-    async fn siphon_ingests_and_updates_cursor() {
+    async fn mirror_ingests_and_updates_cursor() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
         store.init().unwrap();
@@ -216,7 +242,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        siphon_relay(relay_url, cfg.clone(), store.clone())
+        mirror_relay(relay_url, cfg.clone(), store.clone())
             .await
             .unwrap();
         server.abort();
@@ -231,7 +257,7 @@ mod tests {
         assert_eq!(ts.trim(), "2");
     }
     #[tokio::test]
-    async fn siphon_resumes_from_cursor() {
+    async fn mirror_resumes_from_cursor() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
         store.init().unwrap();
@@ -276,7 +302,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Cursor,
         };
-        siphon_relay(relay_url.clone(), cfg, store.clone())
+        mirror_relay(relay_url.clone(), cfg, store.clone())
             .await
             .unwrap();
         server.abort();
@@ -334,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn siphon_via_socks_proxy() {
+    async fn mirror_via_socks_proxy() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
         store.init().unwrap();
@@ -376,13 +402,13 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        siphon_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
         server.abort();
         assert!(dir.path().join("events/aa/11/aa11.json").exists());
     }
 
     #[tokio::test]
-    async fn siphon_sends_filters_in_req() {
+    async fn mirror_sends_filters_in_req() {
         use serde_json::Value;
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
@@ -417,12 +443,12 @@ mod tests {
             filter_tag_t: Some(vec!["tag1".into()]),
             filter_since_mode: SinceMode::Fixed(5),
         };
-        siphon_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
         server.abort();
     }
 
     #[tokio::test]
-    async fn siphon_cursor_mode_without_file_starts_at_zero() {
+    async fn mirror_cursor_mode_without_file_starts_at_zero() {
         use serde_json::Value;
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
@@ -467,7 +493,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Cursor,
         };
-        siphon_relay(relay_url.clone(), cfg, store.clone())
+        mirror_relay(relay_url.clone(), cfg, store.clone())
             .await
             .unwrap();
         server.abort();
@@ -479,7 +505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn siphon_ignores_non_text_messages() {
+    async fn mirror_ignores_non_text_messages() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
         store.init().unwrap();
@@ -519,7 +545,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        siphon_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
         server.abort();
         assert!(dir.path().join("events/aa/11/aa11.json").exists());
     }
@@ -564,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn siphon_logs_ingest_errors() {
+    async fn mirror_logs_ingest_errors() {
         use tokio_tungstenite::tungstenite::protocol::Message as TMsg;
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), true);
@@ -601,7 +627,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        siphon_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
         server.abort();
         assert!(!dir.path().join("events/ba/d0/bad.json").exists());
     }

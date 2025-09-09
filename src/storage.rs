@@ -30,6 +30,14 @@ impl Store {
     }
 
     /// Ensure the on-disk directory structure exists.
+    ///
+    /// Layout overview:
+    /// - `events/` – each event as `<id>.json` nested by hash prefix
+    /// - `log/` – append-only newline-delimited event log
+    /// - `index/` – text files mapping authors, kinds, and tags to IDs
+    /// - `latest/` – pointers for replaceable events (`kind` + `#d`)
+    /// - `mirror/` – symlink trees for author and kind scans
+    /// - `cursor/` – last mirrored timestamps per upstream relay
     pub fn init(&self) -> Result<()> {
         let dirs = [
             "events",
@@ -50,6 +58,12 @@ impl Store {
     }
 
     /// Ingest an event if it doesn't already exist on disk.
+    ///
+    /// Steps:
+    /// 1. Optionally verify the event's Schnorr signature.
+    /// 2. Write the event JSON under `events/<id>.json`.
+    /// 3. Append the event to `log/events.ndjson`.
+    /// 4. Update indexes and create mirror symlinks.
     pub fn ingest(&self, ev: &Event) -> Result<()> {
         // Optionally verify the event's Schnorr signature before writing.
         if self.verify_sig {
@@ -132,14 +146,16 @@ impl Store {
         Ok(())
     }
 
-    /// Update indexes and latest pointers for an event.
+    /// Update text-file indexes and latest pointers for an event.
     fn index_event(&self, ev: &Event) -> Result<()> {
+        // Author and kind indexes are simple append-only lists of IDs.
         self.append_index("index/by-author", &ev.pubkey, &ev.id)?;
         self.append_index("index/by-kind", &ev.kind.to_string(), &ev.id)?;
         for Tag(fields) in &ev.tags {
             if fields.len() >= 2 {
                 match fields[0].as_str() {
                     "d" => {
+                        // `#d` tags also update a latest pointer for replaceable events.
                         self.append_index("index/by-tag/d", &fields[1], &ev.id)?;
                         let latest = self
                             .root
@@ -151,6 +167,7 @@ impl Store {
                         fs::write(latest, &ev.id)?;
                     }
                     "t" => {
+                        // Topic (`#t`) tags get their own index directory.
                         self.append_index("index/by-tag/t", &fields[1], &ev.id)?;
                     }
                     _ => {}
@@ -161,6 +178,9 @@ impl Store {
     }
 
     /// Create symlinks for author and kind mirrors.
+    ///
+    /// These allow fast listing of events by author or kind without scanning
+    /// the entire `events/` tree.
     fn write_mirror_links(&self, ev: &Event) -> Result<()> {
         let rel_target = format!(
             "../../../events/{}/{}/{}.json",
@@ -222,6 +242,11 @@ impl Store {
     }
 
     /// Execute a simple intersection-based query over indexes.
+    ///
+    /// A query like `authors=npub1&kinds=1` works by loading
+    /// `index/by-author/npub1.txt` and `index/by-kind/1.txt`, intersecting the
+    /// resulting ID sets, and then reading each matching event from disk. Time
+    /// bounds and limits are applied after the intersection.
     pub fn query(&self, q: Query) -> Result<Vec<Event>> {
         // Collect ID sets for each filter category and intersect them below.
         let mut sets: Vec<std::collections::HashSet<String>> = vec![];
