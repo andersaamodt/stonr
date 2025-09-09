@@ -38,13 +38,16 @@ async fn handler(ws: WebSocketUpgrade, State(store): State<Arc<Store>>) -> impl 
     ws.on_upgrade(|socket| async move { process(socket, store).await })
 }
 
-/// Process incoming REQ/CLOSE messages on a WebSocket connection.
+/// Process incoming `REQ` and `CLOSE` messages on a WebSocket connection.
 ///
-/// The relay expects NIP-01-style arrays where the first element is a command
-/// string (e.g. `REQ` to subscribe or `CLOSE` to cancel). For each `REQ`, the
-/// third array element is a Nostr filter object which we convert into a `Query`
-/// and feed to the store. Matching events are sent back as `EVENT` messages
-/// followed by an `EOSE` marker.
+/// Clients send arrays such as:
+///
+/// ```json
+/// ["REQ", "sub", {"authors": ["p1"], "kinds": [1]}]
+/// ```
+///
+/// The relay responds with zero or more `EVENT` messages and finally an
+/// `EOSE` marker: `{"EOSE", "sub"}`. `CLOSE` messages are currently ignored.
 async fn process(mut socket: WebSocket, store: Arc<Store>) {
     while let Some(Ok(msg)) = socket.next().await {
         if let Message::Text(txt) = msg {
@@ -56,18 +59,23 @@ async fn process(mut socket: WebSocket, store: Arc<Store>) {
                             let filt = arr[2].clone();
                             let q = Query::from_value(&filt);
                             if let Ok(events) = store.query(q) {
+                                // Emit each matching event back to the subscriber.
                                 for ev in events {
                                     let msg = serde_json::json!(["EVENT", sub, ev]);
                                     let _ = socket.send(Message::Text(msg.to_string())).await;
                                 }
                             }
+                            // Signal end of stored events for this subscription.
                             let eose = serde_json::json!(["EOSE", sub]);
                             let _ = socket.send(Message::Text(eose.to_string())).await;
                         }
                         Some("CLOSE") => {
-                            // ignore for now
+                            // Subscription cancellation is ignored since we don't
+                            // maintain per-subscription state.
                         }
-                        _ => {}
+                        _ => {
+                            // Unknown command – ignore the message.
+                        }
                     }
                 }
             }

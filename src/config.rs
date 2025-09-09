@@ -15,21 +15,21 @@ pub struct Settings {
     pub bind_ws: String,
     /// Enable Schnorr signature verification on ingest.
     pub verify_sig: bool,
-    /// Upstream relays to siphon from.
+    /// Upstream relays to mirror events from.
     pub relays_upstream: Vec<String>,
     /// Optional Tor SOCKS proxy (host:port).
     pub tor_socks: Option<String>,
-    /// Optional author filters for siphoning.
+    /// Optional author filters for mirroring.
     pub filter_authors: Option<Vec<String>>,
-    /// Optional kind filters for siphoning.
+    /// Optional kind filters for mirroring.
     pub filter_kinds: Option<Vec<u32>>,
-    /// Optional `#t` tag filters for siphoning.
+    /// Optional `#t` tag filters for mirroring.
     pub filter_tag_t: Option<Vec<String>>,
-    /// Strategy for determining the starting timestamp when siphoning.
+    /// Strategy for determining the starting timestamp when mirroring.
     pub filter_since_mode: SinceMode,
 }
 
-/// Determines how the siphon derives the `since` value for subscriptions.
+/// Determines how the mirroring process derives the `since` value for subscriptions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SinceMode {
     /// Resume from the last cursor stored per relay.

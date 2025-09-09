@@ -13,8 +13,10 @@ use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use crate::storage::{Query, Store};
 
+/// Response body for the `/healthz` endpoint.
 #[derive(Serialize, Deserialize)]
 struct Health {
+    /// Always "ok" when the server is running.
     status: String,
 }
 
@@ -43,10 +45,14 @@ async fn healthz() -> Json<Health> {
     })
 }
 
+/// Minimal NIP-11 relay information document.
 #[derive(Serialize, Deserialize)]
 struct RelayInfo {
+    /// Human-readable relay name.
     name: String,
+    /// Software identifier (here it is always "stonr").
     software: String,
+    /// Semantic version string such as "0.1.0".
     version: String,
 }
 
@@ -62,18 +68,35 @@ async fn relay_info() -> impl axum::response::IntoResponse {
     )
 }
 
+/// URL query parameters accepted by the `/query` endpoint.
 #[derive(Deserialize)]
 struct QueryParams {
+    /// Comma-separated hex public keys.
     authors: Option<String>,
+    /// Comma-separated kind numbers (e.g. `1,30023`).
     kinds: Option<String>,
+    /// Single `#d` tag value.
     d: Option<String>,
+    /// Single `#t` topic value.
     t: Option<String>,
+    /// Minimum `created_at` timestamp.
     since: Option<String>,
+    /// Maximum `created_at` timestamp.
     until: Option<String>,
+    /// Maximum number of events to return.
     limit: Option<String>,
 }
 
 /// Convert query string parameters into a [`Query`] understood by the store.
+///
+/// Supported URL parameters mirror Nostr filter fields:
+/// - `authors` – comma-separated list of public keys
+/// - `kinds` – comma-separated list of kind numbers
+/// - `d` / `t` – single `#d` or `#t` tag value
+/// - `since` / `until` – Unix timestamps bounding `created_at`
+/// - `limit` – maximum number of events to return
+///
+/// Example: `/query?authors=npub1&kinds=1,30023&since=1700000000`
 fn params_to_query(params: QueryParams) -> Query {
     use serde_json::Value;
     let mut obj = serde_json::Map::new();

@@ -1,7 +1,11 @@
+//! Command line interface for operating the relay. Supports initialization,
+//! ingesting events, serving HTTP/WebSocket endpoints, mirroring from upstream
+//! relays, and signature verification.
+
 mod config;
 mod event;
 mod server;
-mod siphon;
+mod mirror;
 mod storage;
 mod ws;
 
@@ -36,7 +40,7 @@ enum Commands {
     },
     /// Rebuild indexes and latest pointers from existing events.
     Reindex,
-    /// Launch HTTP and WebSocket services (and siphon if configured).
+    /// Launch HTTP and WebSocket services (and mirror if configured).
     Serve,
     /// Verify a random sample of stored events.
     Verify {
@@ -51,9 +55,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let store = Store::new(cfg.store_root.clone(), cfg.verify_sig);
     match cli.command {
         Commands::Init => {
+            // Create the on-disk directory structure.
             store.init()?;
         }
         Commands::Ingest { files } => {
+            // Load each JSON file and store it if not already present.
             for f in files {
                 let data = std::fs::read_to_string(&f)?;
                 let ev: event::Event = serde_json::from_str(&data)?;
@@ -61,17 +67,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Reindex => {
+            // Rebuild indexes and latest pointers from existing events.
             store.reindex()?;
         }
         Commands::Serve => {
+            // Initialize storage then start HTTP and WS servers.
             store.init()?;
             let http_addr: SocketAddr = cfg.bind_http.parse()?;
             let ws_addr: SocketAddr = cfg.bind_ws.parse()?;
-            // If upstream relays are configured, start the siphon in the background.
+            // If upstream relays are configured, start mirroring in the background.
             if !cfg.relays_upstream.is_empty() {
                 let store_clone = store.clone();
                 let cfg_clone = cfg.clone();
-                tokio::spawn(async move { siphon::run(cfg_clone, store_clone).await });
+                tokio::spawn(async move { mirror::run(cfg_clone, store_clone).await });
             }
             let store_http = store.clone();
             let store_ws = store.clone();
@@ -81,6 +89,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Commands::Verify { sample } => {
+            // Randomly verify Schnorr signatures for `sample` events.
             store.verify_sample(sample)?;
         }
     }
@@ -219,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_serve_spawns_siphon() {
+    async fn run_serve_spawns_mirror() {
         let _g = ENV_MUTEX.lock().unwrap();
         for v in [
             "STORE_ROOT",
