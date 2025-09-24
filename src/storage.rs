@@ -65,12 +65,13 @@ impl Store {
     /// 3. Append the event to `log/events.ndjson`.
     /// 4. Update indexes and create mirror symlinks.
     pub fn ingest(&self, ev: &Event) -> Result<()> {
+        validate_event_inputs(ev)?;
         // Optionally verify the event's Schnorr signature before writing.
         if self.verify_sig {
             verify_event(ev)?;
         }
         // Skip ingest if the event already exists on disk.
-        let path = self.event_path(&ev.id);
+        let path = self.event_path(&ev.id)?;
         if path.exists() {
             return Ok(());
         }
@@ -149,12 +150,14 @@ impl Store {
     /// Update text-file indexes and latest pointers for an event.
     fn index_event(&self, ev: &Event) -> Result<()> {
         // Author and kind indexes are simple append-only lists of IDs.
+        ensure_safe_component(&ev.pubkey, "author pubkey")?;
         self.append_index("index/by-author", &ev.pubkey, &ev.id)?;
         self.append_index("index/by-kind", &ev.kind.to_string(), &ev.id)?;
         for Tag(fields) in &ev.tags {
             if fields.len() >= 2 {
                 match fields[0].as_str() {
                     "d" => {
+                        ensure_safe_component(&fields[1], "#d tag value")?;
                         // `#d` tags also update a latest pointer for replaceable events.
                         self.append_index("index/by-tag/d", &fields[1], &ev.id)?;
                         let latest = self
@@ -167,6 +170,7 @@ impl Store {
                         fs::write(latest, &ev.id)?;
                     }
                     "t" => {
+                        ensure_safe_component(&fields[1], "#t tag value")?;
                         // Topic (`#t`) tags get their own index directory.
                         self.append_index("index/by-tag/t", &fields[1], &ev.id)?;
                     }
@@ -182,6 +186,7 @@ impl Store {
     /// These allow fast listing of events by author or kind without scanning
     /// the entire `events/` tree.
     fn write_mirror_links(&self, ev: &Event) -> Result<()> {
+        ensure_safe_component(&ev.pubkey, "author pubkey")?;
         let rel_target = format!(
             "../../../events/{}/{}/{}.json",
             &ev.id[0..2],
@@ -208,6 +213,7 @@ impl Store {
 
     /// Append an event ID to the index file under `prefix/name.txt`.
     fn append_index(&self, prefix: &str, name: &str, id: &str) -> Result<()> {
+        ensure_safe_component(name, "index key")?;
         let path = self.root.join(prefix).join(format!("{}.txt", name));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -221,20 +227,25 @@ impl Store {
     }
 
     /// Compute the canonical path for an event ID.
-    fn event_path(&self, id: &str) -> PathBuf {
+    fn event_path(&self, id: &str) -> Result<PathBuf> {
+        ensure_valid_event_id(id)?;
         let sub1 = &id[0..2];
         let sub2 = &id[2..4];
-        self.root
+        Ok(self
+            .root
             .join("events")
             .join(sub1)
             .join(sub2)
-            .join(format!("{}.json", id))
+            .join(format!("{}.json", id)))
     }
 
     /// Helper to load ID sets for a list of keys under `prefix`.
     fn load_ids(&self, prefix: &str, keys: &[String]) -> Result<std::collections::HashSet<String>> {
         let mut ids = std::collections::HashSet::new();
         for key in keys {
+            if ensure_safe_component(key, "index key").is_err() {
+                continue;
+            }
             let path = self.root.join(prefix).join(format!("{}.txt", key));
             ids.extend(read_ids(&path)?);
         }
@@ -258,12 +269,16 @@ impl Store {
             sets.push(self.load_ids("index/by-kind", &keys)?);
         }
         if let Some(d) = q.d {
-            let path = self.root.join("index/by-tag/d").join(format!("{}.txt", d));
-            sets.push(read_ids(&path)?);
+            if ensure_safe_component(&d, "#d tag value").is_ok() {
+                let path = self.root.join("index/by-tag/d").join(format!("{}.txt", d));
+                sets.push(read_ids(&path)?);
+            }
         }
         if let Some(t) = q.t {
-            let path = self.root.join("index/by-tag/t").join(format!("{}.txt", t));
-            sets.push(read_ids(&path)?);
+            if ensure_safe_component(&t, "#t tag value").is_ok() {
+                let path = self.root.join("index/by-tag/t").join(format!("{}.txt", t));
+                sets.push(read_ids(&path)?);
+            }
         }
         if sets.is_empty() {
             return Ok(vec![]);
@@ -279,7 +294,7 @@ impl Store {
         let mut events: Vec<Event> = ids
             .into_iter()
             .filter_map(|id| {
-                let path = self.event_path(&id);
+                let path = self.event_path(&id).ok()?;
                 let data = fs::read_to_string(path).ok()?;
                 serde_json::from_str(&data).ok()
             })
@@ -321,6 +336,50 @@ fn read_ids(path: &Path) -> Result<std::collections::HashSet<String>> {
     }
     let data = fs::read_to_string(path)?;
     Ok(data.lines().map(|s| s.to_string()).collect())
+}
+
+fn validate_event_inputs(ev: &Event) -> Result<()> {
+    ensure_valid_event_id(&ev.id)?;
+    ensure_safe_component(&ev.pubkey, "pubkey")?;
+    for Tag(fields) in &ev.tags {
+        if fields.len() >= 2 {
+            match fields[0].as_str() {
+                "d" => ensure_safe_component(&fields[1], "#d tag value")?,
+                "t" => ensure_safe_component(&fields[1], "#t tag value")?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_safe_component(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(anyhow!("{} cannot be empty", field));
+    }
+    if value.contains("/") || value.contains("\\") {
+        return Err(anyhow!("{} cannot contain path separators", field));
+    }
+    if value == "." || value == ".." {
+        return Err(anyhow!("{} cannot be '.' or '..'", field));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("{} cannot contain control characters", field));
+    }
+    Ok(())
+}
+
+fn ensure_valid_event_id(id: &str) -> Result<()> {
+    ensure_safe_component(id, "event id")?;
+    if id.len() < 4 {
+        return Err(anyhow!(
+            "event id must be at least 4 hexadecimal characters"
+        ));
+    }
+    if !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("event id must be hexadecimal"));
+    }
+    Ok(())
 }
 
 /// Query parameters accepted by both HTTP and WebSocket interfaces.
@@ -586,6 +645,27 @@ mod tests {
     }
 
     #[test]
+    fn ingest_rejects_short_or_non_hex_id() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path().to_path_buf(), false);
+        store.init().unwrap();
+        let ev = sample_event("ab", "p1", 1, None, 1);
+        assert!(store.ingest(&ev).is_err());
+
+        let ev = sample_event("zzzz", "p1", 1, None, 1);
+        assert!(store.ingest(&ev).is_err());
+    }
+
+    #[test]
+    fn ingest_rejects_pathlike_tag_values() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path().to_path_buf(), false);
+        store.init().unwrap();
+        let ev = sample_event("abcd", "p1", 30023, Some("bad/slug"), 1);
+        assert!(store.ingest(&ev).is_err());
+    }
+
+    #[test]
     fn verify_sample_checks_events() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
@@ -598,7 +678,7 @@ mod tests {
         // corrupt one event's signature
         let mut bad = ev1.clone();
         bad.sig = "00".repeat(64);
-        let path = store.event_path(&bad.id);
+        let path = store.event_path(&bad.id).unwrap();
         fs::write(path, serde_json::to_string(&bad).unwrap()).unwrap();
         assert!(store.verify_sample(10).is_err());
     }
