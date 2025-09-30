@@ -13,6 +13,12 @@ use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use crate::storage::{Query, Store};
 
+#[derive(Clone)]
+struct HttpState {
+    store: Store,
+    verbose: bool,
+}
+
 /// Response body for the `/healthz` endpoint.
 #[derive(Serialize, Deserialize)]
 struct Health {
@@ -24,14 +30,16 @@ struct Health {
 pub async fn serve_http(
     addr: SocketAddr,
     store: Store,
+    verbose: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let state = Arc::new(HttpState { store, verbose });
     let app = Router::new()
         .route("/", get(relay_info))
         .route("/healthz", get(healthz))
         .route("/query", get(query))
-        .with_state(Arc::new(store));
+        .with_state(state);
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -39,7 +47,10 @@ pub async fn serve_http(
 }
 
 /// Health check endpoint.
-async fn healthz() -> Json<Health> {
+async fn healthz(State(state): State<Arc<HttpState>>) -> Json<Health> {
+    if state.verbose {
+        println!("[http] GET /healthz");
+    }
     Json(Health {
         status: "ok".to_string(),
     })
@@ -57,7 +68,10 @@ struct RelayInfo {
 }
 
 /// Basic NIP-11 relay information document.
-async fn relay_info() -> impl axum::response::IntoResponse {
+async fn relay_info(State(state): State<Arc<HttpState>>) -> impl axum::response::IntoResponse {
+    if state.verbose {
+        println!("[http] GET /");
+    }
     (
         [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
         Json(RelayInfo {
@@ -132,12 +146,15 @@ fn params_to_query(params: QueryParams) -> Query {
 
 /// Parse query parameters and return matching events as NDJSON.
 async fn query(
-    State(store): State<Arc<Store>>,
+    State(state): State<Arc<HttpState>>,
     AxumQuery(params): AxumQuery<QueryParams>,
 ) -> axum::response::Response {
     // Translate URL parameters into a `Query` structure shared with the WS API.
     let q = params_to_query(params);
-    let events = store.query(q).unwrap_or_default();
+    let events = state.store.query(q).unwrap_or_default();
+    if state.verbose {
+        println!("[http] GET /query -> {} events", events.len());
+    }
     // Return newline-delimited JSON so clients can stream and parse incrementally.
     let body = events
         .into_iter()
@@ -155,14 +172,27 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use reqwest::{self, header::ACCESS_CONTROL_ALLOW_ORIGIN};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::task;
+
+    fn state(store: &Store, verbose: bool) -> Arc<HttpState> {
+        Arc::new(HttpState {
+            store: store.clone(),
+            verbose,
+        })
+    }
 
     #[tokio::test]
     async fn health_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Router::new().route("/healthz", get(super::healthz));
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path().to_path_buf(), false);
+        let state = state(&store, false);
+        let app = Router::new()
+            .route("/healthz", get(super::healthz))
+            .with_state(state);
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -179,7 +209,12 @@ mod tests {
     async fn relay_info_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Router::new().route("/", get(super::relay_info));
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path().to_path_buf(), false);
+        let state = state(&store, false);
+        let app = Router::new()
+            .route("/", get(super::relay_info))
+            .with_state(state);
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -246,7 +281,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/query", get(super::query))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -299,7 +334,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/query", get(super::query))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -342,7 +377,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/query", get(super::query))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -375,9 +410,10 @@ mod tests {
         store.ingest(&ev).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let state = state(&store, true);
         let app = Router::new()
             .route("/query", get(super::query))
-            .with_state(Arc::new(store));
+            .with_state(state);
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -397,7 +433,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/query", get(super::query))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -417,7 +453,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/query", get(super::query))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = task::spawn(async move {
             server.await.unwrap();
@@ -445,7 +481,7 @@ mod tests {
             let _ = shutdown_rx.await;
         };
         let handle = tokio::spawn(async move {
-            super::serve_http(addr, store_clone, shutdown)
+            super::serve_http(addr, store_clone, false, shutdown)
                 .await
                 .unwrap();
         });
@@ -462,8 +498,7 @@ mod tests {
                         if attempts >= MAX_ATTEMPTS {
                             panic!(
                                 "failed to fetch health endpoint after {} retries: {:?}",
-                                attempts,
-                                err
+                                attempts, err
                             );
                         }
                         tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
@@ -486,8 +521,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
         // binding to the same address should error because it's already taken
-        assert!(super::serve_http(addr, store, std::future::pending())
-            .await
-            .is_err());
+        assert!(
+            super::serve_http(addr, store, false, std::future::pending())
+                .await
+                .is_err()
+        );
     }
 }

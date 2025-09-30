@@ -17,16 +17,22 @@ use serde_json::Value;
 
 use crate::storage::{Query, Store};
 
+#[derive(Clone)]
+struct WsState {
+    store: Store,
+    verbose: bool,
+}
+
 /// Start a WebSocket server speaking a minimal subset of NIP-01.
 pub async fn serve_ws(
     addr: SocketAddr,
     store: Store,
+    verbose: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let app = Router::new()
-        .route("/", get(handler))
-        .with_state(Arc::new(store));
+    let state = Arc::new(WsState { store, verbose });
+    let app = Router::new().route("/", get(handler)).with_state(state);
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -34,8 +40,10 @@ pub async fn serve_ws(
 }
 
 /// Handle the HTTP upgrade and spawn the connection processor.
-async fn handler(ws: WebSocketUpgrade, State(store): State<Arc<Store>>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| async move { process(socket, store).await })
+async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<WsState>>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        process(socket, state).await;
+    })
 }
 
 /// Process incoming `REQ` and `CLOSE` messages on a WebSocket connection.
@@ -48,7 +56,10 @@ async fn handler(ws: WebSocketUpgrade, State(store): State<Arc<Store>>) -> impl 
 ///
 /// The relay responds with zero or more `EVENT` messages and finally an
 /// `EOSE` marker: `{"EOSE", "sub"}`. `CLOSE` messages are currently ignored.
-async fn process(mut socket: WebSocket, store: Arc<Store>) {
+async fn process(mut socket: WebSocket, state: Arc<WsState>) {
+    if state.verbose {
+        println!("[ws] connection opened");
+    }
     while let Some(Ok(msg)) = socket.next().await {
         if let Message::Text(txt) = msg {
             if let Ok(val) = serde_json::from_str::<Value>(&txt) {
@@ -58,28 +69,46 @@ async fn process(mut socket: WebSocket, store: Arc<Store>) {
                             let sub = arr[1].as_str().unwrap_or_default().to_string();
                             let filt = arr[2].clone();
                             let q = Query::from_value(&filt);
-                            if let Ok(events) = store.query(q) {
+                            if state.verbose {
+                                println!("[ws] REQ {sub}");
+                            }
+                            if let Ok(events) = state.store.query(q) {
                                 // Emit each matching event back to the subscriber.
                                 for ev in events {
                                     let msg = serde_json::json!(["EVENT", sub, ev]);
                                     let _ = socket.send(Message::Text(msg.to_string())).await;
+                                    if state.verbose {
+                                        println!("[ws] EVENT {sub}");
+                                    }
                                 }
                             }
                             // Signal end of stored events for this subscription.
                             let eose = serde_json::json!(["EOSE", sub]);
                             let _ = socket.send(Message::Text(eose.to_string())).await;
+                            if state.verbose {
+                                println!("[ws] EOSE {sub}");
+                            }
                         }
                         Some("CLOSE") => {
                             // Subscription cancellation is ignored since we don't
                             // maintain per-subscription state.
+                            if state.verbose {
+                                println!("[ws] CLOSE received");
+                            }
                         }
                         _ => {
                             // Unknown command – ignore the message.
+                            if state.verbose {
+                                println!("[ws] ignored message");
+                            }
                         }
                     }
                 }
             }
         }
+    }
+    if state.verbose {
+        println!("[ws] connection closed");
     }
 }
 
@@ -88,8 +117,16 @@ mod tests {
     use super::*;
     use crate::event::{Event, Tag};
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_tungstenite::tungstenite::protocol::Message as TungMessage;
+
+    fn state(store: &Store, verbose: bool) -> Arc<WsState> {
+        Arc::new(WsState {
+            store: store.clone(),
+            verbose,
+        })
+    }
 
     #[test]
     fn from_value_fields() {
@@ -144,7 +181,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -225,7 +262,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -297,7 +334,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -351,7 +388,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -414,7 +451,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -458,7 +495,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -500,7 +537,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -549,7 +586,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/", get(handler))
-            .with_state(Arc::new(store));
+            .with_state(state(&store, false));
         let server = axum::serve(listener, app.into_make_service());
         let handle = tokio::spawn(async move {
             server.await.unwrap();
@@ -594,7 +631,9 @@ mod tests {
         let store_clone = store.clone();
         let shutdown = tokio::time::sleep(std::time::Duration::from_millis(100));
         let handle = tokio::spawn(async move {
-            super::serve_ws(addr, store_clone, shutdown).await.unwrap();
+            super::serve_ws(addr, store_clone, false, shutdown)
+                .await
+                .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let url = format!("ws://{}/", addr);
@@ -623,7 +662,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path().to_path_buf(), false);
-        assert!(super::serve_ws(addr, store, std::future::pending())
+        assert!(super::serve_ws(addr, store, false, std::future::pending())
             .await
             .is_err());
     }
