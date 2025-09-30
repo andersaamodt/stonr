@@ -19,9 +19,25 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+
+      - name: Build NixOS standalone binary
+        run: |
+          nix-build nix/standalone.nix --out-link result-nixos
+          mkdir -p artifacts
+          cp -L result-nixos/bin/stonr artifacts/stonr-nixos-amd64
+
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
           name: stonr-linux-amd64
           path: target/release/stonr
+          if-no-files-found: error
+
+      - name: Upload NixOS standalone binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: stonr-nixos-amd64
+          path: artifacts/stonr-nixos-amd64
           if-no-files-found: error
