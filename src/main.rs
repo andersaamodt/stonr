@@ -4,16 +4,20 @@
 
 mod config;
 mod event;
-mod server;
 mod mirror;
+mod mirror_config;
+mod server;
 mod storage;
 mod ws;
 
 use std::net::SocketAddr;
 
-use clap::{Parser, Subcommand};
+use anyhow::{anyhow, Result};
+use clap::{Args, Parser, Subcommand};
 use config::Settings;
 use storage::Store;
+
+use crate::mirror_config::{FilterConfig, RelayRequest};
 
 /// Command line interface entry point.
 #[derive(Parser)]
@@ -47,10 +51,176 @@ enum Commands {
         #[arg(long, default_value_t = 1000)]
         sample: usize,
     },
+    /// Manage upstream relay mirroring subscriptions.
+    Mirror {
+        #[command(subcommand)]
+        command: MirrorCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MirrorCommands {
+    /// List configured upstream relays and their requests.
+    List,
+    /// Add a relay entry without any requests.
+    AddRelay { url: String },
+    /// Remove a relay and all of its requests.
+    RemoveRelay { url: String },
+    /// List requests configured for a relay.
+    ListRequests { url: String },
+    /// Create a new request on a relay.
+    AddRequest {
+        url: String,
+        name: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// Update an existing request.
+    UpdateRequest {
+        url: String,
+        name: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// Remove a request from a relay.
+    RemoveRequest { url: String, name: String },
+}
+
+#[derive(Args, Clone, Default)]
+struct FilterArgs {
+    #[arg(long = "author")]
+    authors: Vec<String>,
+    #[arg(long = "kind")]
+    kinds: Vec<u32>,
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    #[arg(long)]
+    since: Option<u64>,
+    #[arg(long)]
+    until: Option<u64>,
+    #[arg(long)]
+    limit: Option<u32>,
+    #[arg(long)]
+    no_cursor: bool,
+}
+
+fn filter_from_args(args: &FilterArgs) -> Result<FilterConfig> {
+    let mut filter = FilterConfig::default();
+    if !args.authors.is_empty() {
+        filter.authors = Some(args.authors.clone());
+    }
+    if !args.kinds.is_empty() {
+        filter.kinds = Some(args.kinds.clone());
+    }
+    if !args.tags.is_empty() {
+        let mut map = std::collections::BTreeMap::new();
+        for entry in &args.tags {
+            let (key, value) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow!("tag filters must use name=value"))?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                return Err(anyhow!("tag filters must use name=value"));
+            }
+            map.entry(key.to_string())
+                .or_insert_with(Vec::new)
+                .push(value.to_string());
+        }
+        filter.tags = map;
+    }
+    filter.since = args.since;
+    filter.until = args.until;
+    filter.limit = args.limit;
+    filter.cursor = !args.no_cursor;
+    Ok(filter)
+}
+
+fn handle_mirror_command(cfg: &Settings, command: MirrorCommands) -> Result<()> {
+    match command {
+        MirrorCommands::List => {
+            let relays = mirror_config::list_relays(&cfg.store_root)?;
+            if relays.is_empty() {
+                println!("(no relays configured)");
+            } else {
+                for relay in relays {
+                    println!("{}", relay.url);
+                    for req in relay.requests {
+                        let filter_json = mirror_config::filter_to_json(&req.filter, None);
+                        println!(
+                            "  - {} {}",
+                            req.name,
+                            serde_json::Value::Object(filter_json)
+                        );
+                    }
+                }
+            }
+        }
+        MirrorCommands::AddRelay { url } => {
+            mirror_config::add_relay(&cfg.store_root, &url)?;
+            println!("added relay {url}");
+        }
+        MirrorCommands::RemoveRelay { url } => {
+            if mirror_config::remove_relay(&cfg.store_root, &url)? {
+                println!("removed relay {url}");
+            } else {
+                return Err(anyhow!("relay not found"));
+            }
+        }
+        MirrorCommands::ListRequests { url } => {
+            let relay = mirror_config::load_relay(&cfg.store_root, &url)?
+                .ok_or_else(|| anyhow!("relay not found"))?;
+            if relay.requests.is_empty() {
+                println!("(no requests)");
+            } else {
+                for req in relay.requests {
+                    let filter_json = mirror_config::filter_to_json(&req.filter, None);
+                    println!("{} {}", req.name, serde_json::Value::Object(filter_json));
+                }
+            }
+        }
+        MirrorCommands::AddRequest { url, name, filter } => {
+            let relay = mirror_config::load_relay(&cfg.store_root, &url)?;
+            if let Some(ref relay_cfg) = relay {
+                if relay_cfg.requests.iter().any(|r| r.name == name) {
+                    return Err(anyhow!("request '{name}' already exists"));
+                }
+            }
+            let filter_cfg = filter_from_args(&filter)?;
+            let request = RelayRequest {
+                name,
+                filter: filter_cfg,
+            };
+            mirror_config::upsert_request(&cfg.store_root, &url, request)?;
+            println!("added request on {url}");
+        }
+        MirrorCommands::UpdateRequest { url, name, filter } => {
+            let relay = mirror_config::load_relay(&cfg.store_root, &url)?
+                .ok_or_else(|| anyhow!("relay not found"))?;
+            if !relay.requests.iter().any(|r| r.name == name) {
+                return Err(anyhow!("request '{name}' not found"));
+            }
+            let filter_cfg = filter_from_args(&filter)?;
+            let request = RelayRequest {
+                name,
+                filter: filter_cfg,
+            };
+            mirror_config::upsert_request(&cfg.store_root, &url, request)?;
+            println!("updated request on {url}");
+        }
+        MirrorCommands::RemoveRequest { url, name } => {
+            if mirror_config::remove_request(&cfg.store_root, &url, &name)? {
+                println!("removed request {name} from {url}");
+            } else {
+                return Err(anyhow!("request '{name}' not found"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Execute the selected CLI subcommand.
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli) -> Result<()> {
     let cfg = Settings::from_env(&cli.env)?;
     let store = Store::new(cfg.store_root.clone(), cfg.verify_sig);
     match cli.command {
@@ -75,12 +245,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             store.init()?;
             let http_addr: SocketAddr = cfg.bind_http.parse()?;
             let ws_addr: SocketAddr = cfg.bind_ws.parse()?;
-            // If upstream relays are configured, start mirroring in the background.
-            if !cfg.relays_upstream.is_empty() {
-                let store_clone = store.clone();
-                let cfg_clone = cfg.clone();
-                tokio::spawn(async move { mirror::run(cfg_clone, store_clone).await });
-            }
+            let store_clone = store.clone();
+            let cfg_clone = cfg.clone();
+            tokio::spawn(async move { mirror::run(cfg_clone, store_clone).await });
             let store_http = store.clone();
             let store_ws = store.clone();
             tokio::try_join!(
@@ -92,13 +259,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // Randomly verify Schnorr signatures for `sample` events.
             store.verify_sample(sample)?;
         }
+        Commands::Mirror { command } => {
+            handle_mirror_command(&cfg, command)?;
+        }
     }
     Ok(())
 }
 
 #[cfg(not(test))]
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     run(cli).await
 }
@@ -266,5 +436,100 @@ mod tests {
         let resp = reqwest::get(url).await.unwrap();
         assert!(resp.status().is_success());
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mirror_cli_updates_config() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        for v in [
+            "STORE_ROOT",
+            "BIND_HTTP",
+            "BIND_WS",
+            "VERIFY_SIG",
+            "RELAYS_UPSTREAM",
+            "TOR_SOCKS",
+        ] {
+            std::env::remove_var(v);
+        }
+        let dir = TempDir::new().unwrap();
+        let env_file = write_env(&dir, "").await;
+        let url = "wss://relay.example".to_string();
+
+        run(Cli {
+            env: env_file.clone(),
+            command: Commands::Mirror {
+                command: MirrorCommands::AddRelay { url: url.clone() },
+            },
+        })
+        .await
+        .unwrap();
+
+        run(Cli {
+            env: env_file.clone(),
+            command: Commands::Mirror {
+                command: MirrorCommands::AddRequest {
+                    url: url.clone(),
+                    name: "default".into(),
+                    filter: FilterArgs {
+                        authors: vec!["npub1".into()],
+                        kinds: vec![1],
+                        tags: vec!["t=topic".into()],
+                        since: Some(1),
+                        until: None,
+                        limit: Some(10),
+                        no_cursor: true,
+                    },
+                },
+            },
+        })
+        .await
+        .unwrap();
+
+        let relay = mirror_config::load_relay(dir.path(), &url)
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.requests.len(), 1);
+        let req = &relay.requests[0];
+        assert_eq!(req.name, "default");
+        assert_eq!(
+            req.filter.authors.as_ref().unwrap(),
+            &vec![String::from("npub1")]
+        );
+        assert_eq!(req.filter.kinds.as_ref().unwrap(), &vec![1]);
+        assert_eq!(
+            req.filter.tags.get("t").unwrap(),
+            &vec![String::from("topic")]
+        );
+        assert_eq!(req.filter.since, Some(1));
+        assert_eq!(req.filter.limit, Some(10));
+        assert!(!req.filter.cursor);
+
+        run(Cli {
+            env: env_file.clone(),
+            command: Commands::Mirror {
+                command: MirrorCommands::RemoveRequest {
+                    url: url.clone(),
+                    name: "default".into(),
+                },
+            },
+        })
+        .await
+        .unwrap();
+        let relay = mirror_config::load_relay(dir.path(), &url)
+            .unwrap()
+            .unwrap();
+        assert!(relay.requests.is_empty());
+
+        run(Cli {
+            env: env_file,
+            command: Commands::Mirror {
+                command: MirrorCommands::RemoveRelay { url: url.clone() },
+            },
+        })
+        .await
+        .unwrap();
+        assert!(mirror_config::load_relay(dir.path(), &url)
+            .unwrap()
+            .is_none());
     }
 }

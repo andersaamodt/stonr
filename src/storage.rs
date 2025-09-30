@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use chrono::{Datelike, Utc};
 use hex;
 use rand::{seq::SliceRandom, thread_rng};
 use secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
@@ -32,7 +33,7 @@ impl Store {
     /// Ensure the on-disk directory structure exists.
     ///
     /// Layout overview:
-    /// - `events/` – each event as `<id>.json` nested by hash prefix
+    /// - `events/` – each event as `<YYYY>/<MM>/<DD>/<id>.json`
     /// - `log/` – append-only newline-delimited event log
     /// - `index/` – text files mapping authors, kinds, and tags to IDs
     /// - `latest/` – pointers for replaceable events (`kind` + `#d`)
@@ -41,6 +42,7 @@ impl Store {
     pub fn init(&self) -> Result<()> {
         let dirs = [
             "events",
+            "events/by-id",
             "log",
             "latest",
             "index/by-author",
@@ -49,6 +51,7 @@ impl Store {
             "index/by-tag/t",
             "mirror/authors",
             "mirror/kinds",
+            "mirror/relays",
             "cursor",
         ];
         for d in dirs {
@@ -71,11 +74,12 @@ impl Store {
             verify_event(ev)?;
         }
         // Skip ingest if the event already exists on disk.
-        let path = self.event_path(&ev.id)?;
-        if path.exists() {
-            return Ok(());
+        if let Some(existing) = self.locate_event(&ev.id)? {
+            if existing.exists() {
+                return Ok(());
+            }
         }
-        // Write the event JSON atomically to its canonical path.
+        let path = self.allocate_event_path(&ev.id)?;
         let parent_dir = path
             .parent()
             .map(|p| p.to_path_buf())
@@ -84,6 +88,7 @@ impl Store {
         let tmp = tempfile::NamedTempFile::new_in(&parent_dir)?;
         to_writer(&tmp, ev)?;
         tmp.persist(&path)?;
+        self.write_event_mapping(&ev.id, &path)?;
 
         // Append the event to a newline-delimited log for easy tailing.
         let log_path = self.root.join("log/events.ndjson");
@@ -105,6 +110,9 @@ impl Store {
         for entry in walkdir::WalkDir::new(self.root.join("events")) {
             let entry = entry?;
             if entry.file_type().is_file() {
+                if entry.path().starts_with(self.root.join("events/by-id")) {
+                    continue;
+                }
                 paths.push(entry.into_path());
             }
         }
@@ -139,6 +147,9 @@ impl Store {
         for entry in walkdir::WalkDir::new(self.root.join("events")) {
             let entry = entry?;
             if entry.file_type().is_file() {
+                if entry.path().starts_with(self.root.join("events/by-id")) {
+                    continue;
+                }
                 let data = fs::read_to_string(entry.path())?;
                 let ev: Event = serde_json::from_str(&data)?;
                 self.index_event(&ev)?;
@@ -187,18 +198,13 @@ impl Store {
     /// the entire `events/` tree.
     fn write_mirror_links(&self, ev: &Event) -> Result<()> {
         ensure_safe_component(&ev.pubkey, "author pubkey")?;
-        let rel_target = format!(
-            "../../../events/{}/{}/{}.json",
-            &ev.id[0..2],
-            &ev.id[2..4],
-            ev.id
-        );
+        let target = self.event_path(&ev.id)?;
         // by author
         let author_dir = self.root.join("mirror/authors").join(&ev.pubkey);
         fs::create_dir_all(&author_dir)?;
         let author_link = author_dir.join(format!("{}-{}.json", ev.created_at, ev.id));
         if !author_link.exists() {
-            unix_fs::symlink(&rel_target, &author_link)?;
+            unix_fs::symlink(&target, &author_link)?;
         }
 
         // by kind
@@ -206,7 +212,7 @@ impl Store {
         fs::create_dir_all(&kind_dir)?;
         let kind_link = kind_dir.join(format!("{}-{}.json", ev.created_at, ev.id));
         if !kind_link.exists() {
-            unix_fs::symlink(rel_target, kind_link)?;
+            unix_fs::symlink(&target, kind_link)?;
         }
         Ok(())
     }
@@ -228,15 +234,63 @@ impl Store {
 
     /// Compute the canonical path for an event ID.
     fn event_path(&self, id: &str) -> Result<PathBuf> {
+        if let Some(path) = self.locate_event(id)? {
+            Ok(path)
+        } else {
+            Err(anyhow!("event not found"))
+        }
+    }
+
+    /// Locate an event on disk, supporting both new and legacy layouts.
+    fn locate_event(&self, id: &str) -> Result<Option<PathBuf>> {
         ensure_valid_event_id(id)?;
-        let sub1 = &id[0..2];
-        let sub2 = &id[2..4];
+        let mapping = self.root.join("events/by-id").join(format!("{}.path", id));
+        if let Ok(rel) = fs::read_to_string(&mapping) {
+            let trimmed = rel.trim();
+            if !trimmed.is_empty() {
+                let path = self.root.join("events").join(trimmed);
+                if path.exists() {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        let legacy = self
+            .root
+            .join("events")
+            .join(&id[0..2])
+            .join(&id[2..4])
+            .join(format!("{}.json", id));
+        if legacy.exists() {
+            return Ok(Some(legacy));
+        }
+        Ok(None)
+    }
+
+    /// Allocate a new storage path for an event based on the current date.
+    fn allocate_event_path(&self, id: &str) -> Result<PathBuf> {
+        ensure_valid_event_id(id)?;
+        let now = Utc::now().date_naive();
         Ok(self
             .root
             .join("events")
-            .join(sub1)
-            .join(sub2)
+            .join(format!("{:04}", now.year()))
+            .join(format!("{:02}", now.month()))
+            .join(format!("{:02}", now.day()))
             .join(format!("{}.json", id)))
+    }
+
+    /// Persist a mapping from event ID to its on-disk location.
+    fn write_event_mapping(&self, id: &str, path: &Path) -> Result<()> {
+        ensure_valid_event_id(id)?;
+        let events_root = self.root.join("events");
+        let relative = path
+            .strip_prefix(&events_root)
+            .map_err(|_| anyhow!("event path outside store"))?;
+        let map_dir = self.root.join("events/by-id");
+        fs::create_dir_all(&map_dir)?;
+        let map_path = map_dir.join(format!("{}.path", id));
+        fs::write(map_path, relative.to_string_lossy().to_string())?;
+        Ok(())
     }
 
     /// Helper to load ID sets for a list of keys under `prefix`.
@@ -519,6 +573,11 @@ mod tests {
         let ids = fs::read_to_string(id_path).unwrap();
         assert_eq!(ids.lines().count(), 1);
         assert!(store.root.join("cursor").exists());
+        let map_path = store.root.join("events/by-id/abcd.path");
+        assert!(map_path.exists());
+        let rel = fs::read_to_string(&map_path).unwrap();
+        let event_path = store.root.join("events").join(rel.trim());
+        assert!(event_path.exists());
     }
 
     #[test]
@@ -531,14 +590,11 @@ mod tests {
         let author_link = dir.path().join(format!("mirror/authors/pub/42-abcd.json"));
         assert!(author_link.exists());
         let target = fs::read_link(&author_link).unwrap();
-        assert!(target.to_str().unwrap().ends_with("events/ab/cd/abcd.json"));
+        assert_eq!(target, store.event_path(&ev.id).unwrap());
         let kind_link = dir.path().join(format!("mirror/kinds/30023/42-abcd.json"));
         assert!(kind_link.exists());
         let target2 = fs::read_link(kind_link).unwrap();
-        assert!(target2
-            .to_str()
-            .unwrap()
-            .ends_with("events/ab/cd/abcd.json"));
+        assert_eq!(target2, store.event_path(&ev.id).unwrap());
     }
 
     #[test]
