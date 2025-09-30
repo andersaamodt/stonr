@@ -462,8 +462,7 @@ mod tests {
                         if attempts >= MAX_ATTEMPTS {
                             panic!(
                                 "failed to fetch health endpoint after {} retries: {:?}",
-                                attempts,
-                                err
+                                attempts, err
                             );
                         }
                         tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;

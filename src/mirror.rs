@@ -134,6 +134,17 @@ async fn connect_ws(
     Ok(ws)
 }
 
+/// Attempt a lightweight connection to a relay to ensure it is reachable.
+///
+/// Establishes a WebSocket, immediately closes it, and returns any encountered
+/// network or handshake error to the caller so the CLI can surface failures
+/// before persisting configuration.
+pub async fn test_connection(relay: &str, tor_socks: Option<&str>) -> Result<()> {
+    let mut ws = connect_ws(relay, tor_socks).await?;
+    ws.close(None).await?;
+    Ok(())
+}
+
 /// Blanket trait for boxed async read/write streams.
 ///
 /// `TcpStream` and `Socks5Stream` implement the standard `AsyncRead` and
