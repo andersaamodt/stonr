@@ -145,12 +145,10 @@ fn init_and_ingest_cli_store_event() {
         .success();
 
     let id = ev["id"].as_str().unwrap();
-    let stored = dir
-        .path()
-        .join("events")
-        .join(&id[0..2])
-        .join(&id[2..4])
-        .join(format!("{}.json", id));
+    let map_path = dir.path().join("events/by-id").join(format!("{}.path", id));
+    assert!(map_path.exists());
+    let rel = fs::read_to_string(map_path).unwrap();
+    let stored = dir.path().join("events").join(rel.trim());
     assert!(stored.exists());
 }
 
@@ -165,7 +163,7 @@ fn cli_help_lists_commands() {
         .stdout
         .clone();
     let text = String::from_utf8(output).unwrap();
-    for cmd in ["init", "ingest", "serve", "reindex", "verify"] {
+    for cmd in ["init", "ingest", "serve", "reindex", "verify", "mirror"] {
         assert!(text.contains(cmd));
     }
 }

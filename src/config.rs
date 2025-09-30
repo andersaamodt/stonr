@@ -16,16 +16,21 @@ pub struct Settings {
     /// Enable Schnorr signature verification on ingest.
     pub verify_sig: bool,
     /// Upstream relays to mirror events from.
+    #[allow(dead_code)]
     pub relays_upstream: Vec<String>,
     /// Optional Tor SOCKS proxy (host:port).
     pub tor_socks: Option<String>,
     /// Optional author filters for mirroring.
+    #[allow(dead_code)]
     pub filter_authors: Option<Vec<String>>,
     /// Optional kind filters for mirroring.
+    #[allow(dead_code)]
     pub filter_kinds: Option<Vec<u32>>,
     /// Optional `#t` tag filters for mirroring.
+    #[allow(dead_code)]
     pub filter_tag_t: Option<Vec<String>>,
     /// Strategy for determining the starting timestamp when mirroring.
+    #[allow(dead_code)]
     pub filter_since_mode: SinceMode,
 }
 

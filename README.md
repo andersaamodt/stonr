@@ -4,7 +4,8 @@ Stonr is a file-backed [Nostr](https://github.com/nostr-protocol/nostr) relay im
 
 ## How it works
 
-Events are stored as individual JSON files on disk. Plain-text index files and
+Events are stored as individual JSON files on disk, grouped by the day they
+were received (`events/<YYYY>/<MM>/<DD>/<id>.json`). Plain-text index files and
 symlink “mirrors” allow quick lookup by author, kind, or tag without scanning
 the entire tree. The pieces fit together like this:
 
@@ -51,12 +52,8 @@ Runtime settings are read from a `.env` file:
 | `BIND_HTTP` | HTTP listen address | `127.0.0.1:7777` | _required_ |
 | `BIND_WS` | WebSocket listen address | `127.0.0.1:7778` | _required_ |
 | `VERIFY_SIG` | `1` to verify Schnorr signatures on ingest | `1` | `0` |
-| `RELAYS_UPSTREAM` | Comma‑separated upstream relays to mirror | `wss://relay.example` | _none_ |
+| `RELAYS_UPSTREAM` | Optional bootstrap list of upstream relays | `wss://relay.example` | _none_ |
 | `TOR_SOCKS` | Tor SOCKS proxy address ([details](docs/onion.md)) | `127.0.0.1:9050` | _none_ |
-| `FILTER_AUTHORS` | Authors to mirror, comma‑separated | `npub1...,npub2...` | _none_ |
-| `FILTER_KINDS` | Kind numbers to mirror | `1,30023` | _none_ |
-| `FILTER_TAG_T` | `#t` tag values to mirror | `essay,philosophy` | _none_ |
-| `FILTER_SINCE_MODE` | `cursor` or `fixed:<unix>` start time | `fixed:1700000000` | `cursor` |
 
 Example `.env`:
 
@@ -64,9 +61,16 @@ Example `.env`:
 STORE_ROOT=/srv/stonr
 BIND_HTTP=127.0.0.1:7777
 BIND_WS=127.0.0.1:7778
-RELAYS_UPSTREAM=wss://relay.example
-FILTER_KINDS=1
-FILTER_SINCE_MODE=cursor
+```
+
+Mirroring configuration—relay URLs, subscriptions, and filters—is managed at
+runtime through the CLI:
+
+```bash
+stonr mirror add-relay wss://relay.example
+stonr mirror add-request wss://relay.example default \
+  --author npub1example --kind 1 --tag t=nostr --since 1700000000
+stonr mirror list
 ```
 
 ## CLI
@@ -77,6 +81,7 @@ stonr ingest events/*.json
 stonr reindex --env .env
 stonr serve --env .env
 stonr verify --env .env --sample 1000
+stonr mirror --help
 ```
 
 ## Build and Test
