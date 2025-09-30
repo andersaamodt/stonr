@@ -440,17 +440,42 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let store_clone = store.clone();
-        let shutdown = tokio::time::sleep(Duration::from_millis(100));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
         let handle = tokio::spawn(async move {
             super::serve_http(addr, store_clone, shutdown)
                 .await
                 .unwrap();
         });
-        // give server a moment to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let url = format!("http://{}/healthz", addr);
-        let resp: super::Health = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        let resp: super::Health = {
+            let mut attempts = 0;
+            const MAX_ATTEMPTS: usize = 50;
+            const RETRY_DELAY_MS: u64 = 50;
+            loop {
+                match reqwest::get(&url).await {
+                    Ok(resp) => break resp,
+                    Err(err) => {
+                        attempts += 1;
+                        if attempts >= MAX_ATTEMPTS {
+                            panic!(
+                                "failed to fetch health endpoint after {} retries: {:?}",
+                                attempts,
+                                err
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    }
+                }
+            }
+        }
+        .json()
+        .await
+        .unwrap();
         assert_eq!(resp.status, "ok");
+        let _ = shutdown_tx.send(());
         handle.await.unwrap();
     }
 
