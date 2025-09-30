@@ -27,6 +27,29 @@ stonr mirror list
 ```
 
 Requests can be updated or removed with `update-request` and `remove-request`.
+`stonr --help` now lists every mirror subcommand along with the filter flags
+available to `add-request` and `update-request`:
+
+```
+Mirror subcommands:
+  list                         List configured upstream relays and their requests
+  add-relay <URL>               Add a relay entry without any requests
+  remove-relay <URL>            Remove a relay and all of its requests
+  list-requests <URL>           List requests configured for a relay
+  add-request <URL> <NAME>      Create a new request on a relay
+  update-request <URL> <NAME>   Update an existing request
+  remove-request <URL> <NAME>   Remove a request from a relay
+
+Filter flags (for add-request/update-request):
+  --author <PUBKEY>             Repeatable author filters
+  --kind <KIND>                 Repeatable numeric kind filters
+  --tag <NAME=VALUE>            Repeatable #tag filters
+  --since <TIMESTAMP>           Lower UNIX timestamp bound
+  --until <TIMESTAMP>           Upper UNIX timestamp bound
+  --limit <COUNT>               Hint to limit the subscription size
+  --no-cursor                   Disable resume cursors for the request
+```
+
 All configuration is stored under `STORE_ROOT/mirror/relays/`, so changes are
 picked up automatically by a running `stonr serve` process.
 

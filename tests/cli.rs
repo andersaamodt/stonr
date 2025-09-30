@@ -166,4 +166,37 @@ fn cli_help_lists_commands() {
     for cmd in ["init", "ingest", "serve", "reindex", "verify", "mirror"] {
         assert!(text.contains(cmd));
     }
+    assert!(text.contains("Mirror subcommands:"));
+    assert!(text.contains("add-request"));
+    assert!(text.contains("--author <PUBKEY>"));
+}
+
+#[test]
+fn cli_help_flag_allows_scoped_help() {
+    let output = Command::cargo_bin("stonr")
+        .unwrap()
+        .args(["--help", "mirror"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("mirror"));
+    assert!(text.contains("add-relay"));
+}
+
+#[test]
+fn cli_help_subcommand_still_works() {
+    let output = Command::cargo_bin("stonr")
+        .unwrap()
+        .args(["help", "mirror"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("mirror"));
+    assert!(text.contains("add-relay"));
 }

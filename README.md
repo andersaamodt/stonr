@@ -73,6 +73,34 @@ stonr mirror add-request wss://relay.example default \
 stonr mirror list
 ```
 
+### Mirror CLI reference
+
+`stonr mirror` manages both the upstream relays and the individual Nostr
+requests configured for each relay:
+
+```
+stonr mirror list                   # list configured relays and their requests
+stonr mirror add-relay <URL>        # register a relay without any requests
+stonr mirror remove-relay <URL>     # delete a relay and all of its requests
+stonr mirror list-requests <URL>    # show requests defined on a relay
+stonr mirror add-request <URL> <NAME>
+stonr mirror update-request <URL> <NAME>
+stonr mirror remove-request <URL> <NAME>
+```
+
+`add-request` and `update-request` accept a suite of Nostr filter flags so you
+can scope the mirrored data:
+
+```
+--author <PUBKEY>    repeatable author filters (hex or npub)
+--kind <KIND>        repeatable numeric kinds
+--tag <NAME=VALUE>   repeatable #t tag filters (e.g. --tag t=nostr)
+--since <TIMESTAMP>  lower UNIX timestamp bound
+--until <TIMESTAMP>  upper UNIX timestamp bound
+--limit <COUNT>      hint to limit the subscription size
+--no-cursor          disable resume cursors for the request
+```
+
 ## CLI
 
 ```
