@@ -16,12 +16,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run tests
+        run: cargo test --locked
+
       - name: Build release binary
         run: cargo build --locked --release
 
-      - name: Upload release binary
+      - name: Package release tarball
+        run: |
+          tar -czf stonr-linux-amd64.tar.gz -C target/release stonr
+
+      - name: Upload release tarball
         uses: actions/upload-artifact@v4
         with:
-          name: stonr-linux-amd64
-          path: target/release/stonr
+          name: stonr-linux-amd64.tar.gz
+          path: stonr-linux-amd64.tar.gz
           if-no-files-found: error
