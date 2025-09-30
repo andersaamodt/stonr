@@ -4,10 +4,14 @@ on:
   pull_request:
     branches:
       - '**'
+  release:
+    types: [published]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -16,12 +20,60 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
+      - name: Build glibc release binary
         run: cargo build --locked --release
 
-      - name: Upload release binary
+      - name: Install MUSL toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Add MUSL compilation target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Build MUSL release binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      - name: Prepare distributable archives
+        run: |
+          install -d dist/glibc dist/musl
+          cp target/release/stonr dist/glibc/stonr
+          tar -C dist/glibc -czf dist/stonr-linux-amd64.tar.gz stonr
+          cp target/x86_64-unknown-linux-musl/release/stonr dist/musl/stonr
+          tar -C dist/musl -czf dist/stonr-linux-amd64-musl.tar.gz stonr
+
+      - name: Upload glibc artifact
         uses: actions/upload-artifact@v4
         with:
           name: stonr-linux-amd64
-          path: target/release/stonr
+          path: dist/stonr-linux-amd64.tar.gz
           if-no-files-found: error
+
+      - name: Upload MUSL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stonr-linux-amd64-musl
+          path: dist/stonr-linux-amd64-musl.tar.gz
+          if-no-files-found: error
+
+      - name: Attach glibc artifact to release
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: dist/stonr-linux-amd64.tar.gz
+          asset_name: stonr-linux-amd64.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Attach MUSL artifact to release
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: dist/stonr-linux-amd64-musl.tar.gz
+          asset_name: stonr-linux-amd64-musl.tar.gz
+          asset_content_type: application/gzip

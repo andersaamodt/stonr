@@ -1,17 +1,26 @@
 //! Upstream relay mirroring for importing events into the local store.
 
-use std::path::PathBuf;
+use std::{
+    io,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{client_async, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{
+    client_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream, WebSocketStream,
+};
 use url::Url;
+use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::{
     config::{Settings, SinceMode},
@@ -20,12 +29,12 @@ use crate::{
 };
 
 /// Spawn a mirroring task for each configured upstream relay.
-pub async fn run(cfg: Settings, store: Store) {
+pub async fn run(cfg: Settings, store: Store, verbose: bool) {
     for relay in cfg.relays_upstream.clone() {
         let cfg_clone = cfg.clone();
         let store_clone = store.clone();
         tokio::spawn(async move {
-            if let Err(e) = mirror_relay(relay, cfg_clone, store_clone).await {
+            if let Err(e) = mirror_relay(relay.clone(), cfg_clone, store_clone, verbose).await {
                 eprintln!("mirror error: {e}");
             }
         });
@@ -43,7 +52,7 @@ pub async fn run(cfg: Settings, store: Store) {
 ///    updating the latest timestamp seen.
 /// 4. After receiving `EOSE`, write the cursor so the next run resumes from the
 ///    newest event.
-async fn mirror_relay(relay: String, cfg: Settings, store: Store) -> Result<()> {
+async fn mirror_relay(relay: String, cfg: Settings, store: Store, verbose: bool) -> Result<()> {
     // Determine the starting timestamp either from a stored cursor or a fixed
     // configuration value.
     let since = match cfg.filter_since_mode {
@@ -75,7 +84,13 @@ async fn mirror_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
     }
     let req = json!(["REQ", "mirror", Value::Object(filter)]);
     // Open the WebSocket (optionally through Tor) and send the subscription.
+    if verbose {
+        println!("[{relay}] connecting (since {since})");
+    }
     let mut ws = connect_ws(&relay, cfg.tor_socks.as_deref()).await?;
+    if verbose {
+        println!("[{relay}] subscribed");
+    }
     ws.send(Message::Text(req.to_string())).await?;
     let mut latest = since;
     // Consume messages until EOSE, persisting each event and tracking the
@@ -91,6 +106,8 @@ async fn mirror_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
                                     latest = latest.max(ev.created_at);
                                     if let Err(e) = store.ingest(&ev) {
                                         eprintln!("ingest error: {e}");
+                                    } else if verbose {
+                                        println!("[{relay}] stored event {}", ev.id);
                                     }
                                 }
                             }
@@ -106,42 +123,116 @@ async fn mirror_relay(relay: String, cfg: Settings, store: Store) -> Result<()> 
     }
     // Persist the cursor so the next run resumes from where we left off.
     write_cursor(&cfg.store_root, &relay, latest)?;
+    if verbose {
+        println!("[{relay}] caught up to {latest}");
+    }
     Ok(())
 }
 
 /// Establish a WebSocket connection, optionally via a SOCKS5 proxy.
 ///
 /// The underlying TCP stream may either be a direct `TcpStream` or a
-/// `Socks5Stream` when routing through Tor. To hide this difference the stream
-/// is boxed as a `dyn AsyncReadWrite`, allowing the caller to treat both cases
-/// uniformly. Any network or handshake errors bubble up to the caller.
+/// `Socks5Stream` when routing through Tor. The `Transport` enum erases this
+/// difference while still letting TLS handshakes wrap the socket when needed.
+/// Any network or handshake errors bubble up to the caller.
 async fn connect_ws(
     relay: &str,
     tor_socks: Option<&str>,
-) -> Result<WebSocketStream<Box<dyn AsyncReadWrite + Unpin + Send>>> {
+) -> Result<WebSocketStream<MaybeTlsStream<Transport>>> {
     let url = Url::parse(relay)?;
     let host = url.host_str().ok_or_else(|| anyhow!("missing host"))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("missing port"))?;
     let req = relay.into_client_request()?;
-    let stream: Box<dyn AsyncReadWrite + Unpin + Send> = if let Some(proxy) = tor_socks {
-        Box::new(Socks5Stream::connect(proxy, (host, port)).await?)
+    let stream = if let Some(proxy) = tor_socks {
+        Transport::Socks(Socks5Stream::connect(proxy, (host, port)).await?)
     } else {
-        Box::new(TcpStream::connect((host, port)).await?)
+        Transport::Tcp(TcpStream::connect((host, port)).await?)
     };
-    let (ws, _) = client_async(req, stream).await?;
+    let tls = if url.scheme() == "wss" {
+        Some(rustls_connector()?)
+    } else {
+        None
+    };
+    let (ws, _) = client_async_tls_with_config(req, stream, None, tls).await?;
     Ok(ws)
 }
 
-/// Blanket trait for boxed async read/write streams.
+/// Attempt a lightweight connection to a relay to ensure it is reachable.
 ///
-/// `TcpStream` and `Socks5Stream` implement the standard `AsyncRead` and
-/// `AsyncWrite` traits but have different concrete types. Boxing them behind a
-/// trait object lets `connect_ws` return a single stream type regardless of how
-/// the connection was established.
-trait AsyncReadWrite: AsyncRead + AsyncWrite {}
-impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
+/// Establishes a WebSocket, immediately closes it, and returns any encountered
+/// network or handshake error to the caller so the CLI can surface failures
+/// before persisting configuration.
+pub async fn test_connection(relay: &str, tor_socks: Option<&str>) -> Result<()> {
+    let mut ws = connect_ws(relay, tor_socks).await?;
+    ws.close(None).await?;
+    Ok(())
+}
+
+fn rustls_connector() -> Result<Connector> {
+    use tokio_rustls::rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
+    let mut roots = RootCertStore::empty();
+    roots.add_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
+        OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
+enum Transport {
+    Tcp(TcpStream),
+    Socks(Socks5Stream<TcpStream>),
+}
+
+impl AsyncRead for Transport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Transport::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            Transport::Socks(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Transport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Transport::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            Transport::Socks(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Transport::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            Transport::Socks(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Transport::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            Transport::Socks(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Unpin for Transport {}
 
 /// Compute the cursor file path for a relay URL.
 ///
@@ -242,7 +333,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        mirror_relay(relay_url, cfg.clone(), store.clone())
+        mirror_relay(relay_url, cfg.clone(), store.clone(), false)
             .await
             .unwrap();
         server.abort();
@@ -302,7 +393,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Cursor,
         };
-        mirror_relay(relay_url.clone(), cfg, store.clone())
+        mirror_relay(relay_url.clone(), cfg, store.clone(), false)
             .await
             .unwrap();
         server.abort();
@@ -402,7 +493,9 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone(), false)
+            .await
+            .unwrap();
         server.abort();
         assert!(dir.path().join("events/aa/11/aa11.json").exists());
     }
@@ -443,7 +536,9 @@ mod tests {
             filter_tag_t: Some(vec!["tag1".into()]),
             filter_since_mode: SinceMode::Fixed(5),
         };
-        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone(), false)
+            .await
+            .unwrap();
         server.abort();
     }
 
@@ -493,7 +588,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Cursor,
         };
-        mirror_relay(relay_url.clone(), cfg, store.clone())
+        mirror_relay(relay_url.clone(), cfg, store.clone(), false)
             .await
             .unwrap();
         server.abort();
@@ -545,7 +640,9 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone(), false)
+            .await
+            .unwrap();
         server.abort();
         assert!(dir.path().join("events/aa/11/aa11.json").exists());
     }
@@ -585,7 +682,7 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        super::run(cfg, store).await;
+        super::run(cfg, store, false).await;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
@@ -627,7 +724,9 @@ mod tests {
             filter_tag_t: None,
             filter_since_mode: SinceMode::Fixed(0),
         };
-        mirror_relay(relay_url, cfg, store.clone()).await.unwrap();
+        mirror_relay(relay_url, cfg, store.clone(), false)
+            .await
+            .unwrap();
         server.abort();
         assert!(!dir.path().join("events/ba/d0/bad.json").exists());
     }

@@ -31,12 +31,17 @@ stonr init --env .env
 # 2. Ingest a sample event into the store
 stonr ingest sample.json
 
-# 3. Start the HTTP and WebSocket servers
-stonr serve --env .env
+# 3. Start the HTTP and WebSocket servers (add --verbose/-v for live logs)
+stonr serve --env .env --verbose
 
 # 4. Query events over HTTP
 curl "http://localhost:7777/query?authors=npub1&kinds=1"
 ```
+
+Running any command will bootstrap `.env` with sensible defaults if it is missing,
+placing `stonr-data/` next to the config file. Add `--verbose` (or `-v`) to `stonr serve`
+to print HTTP requests, WebSocket subscriptions, and mirror progress as they
+happen.
 
 See [docs/api.md](docs/api.md) for HTTP and WebSocket details,
 [docs/mirroring.md](docs/mirroring.md) for mirroring setups, and
@@ -69,14 +74,26 @@ FILTER_KINDS=1
 FILTER_SINCE_MODE=cursor
 ```
 
+## Mirroring upstream relays
+
+Set `RELAYS_UPSTREAM` to a comma-separated list of relay URLs in your `.env`
+file. Optional `FILTER_AUTHORS`, `FILTER_KINDS`, `FILTER_TAG_T`, and
+`FILTER_SINCE_MODE` values narrow the subscription. After updating the config,
+run `stonr serve --env .env [--verbose|-v]` to connect and start ingesting mirrored events. You
+can also manage entries with `stonr mirror add <url>` (which verifies the relay
+before saving it) and `stonr mirror remove <url>`. See
+[docs/mirroring.md](docs/mirroring.md) for detailed examples.
+
 ## CLI
 
 ```
 stonr init --env .env
 stonr ingest events/*.json
 stonr reindex --env .env
-stonr serve --env .env
+stonr serve --env .env [--verbose|-v]
 stonr verify --env .env --sample 1000
+stonr mirror add wss://relay.example
+stonr mirror remove wss://relay.example
 ```
 
 ## Build and Test

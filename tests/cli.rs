@@ -169,3 +169,26 @@ fn cli_help_lists_commands() {
         assert!(text.contains(cmd));
     }
 }
+
+#[test]
+fn short_version_flag_prints_version() {
+    let output = Command::cargo_bin("stonr")
+        .unwrap()
+        .arg("-v")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.trim(), env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn serve_accepts_short_verbose_flag() {
+    Command::cargo_bin("stonr")
+        .unwrap()
+        .args(["serve", "-v", "--help"])
+        .assert()
+        .success();
+}
