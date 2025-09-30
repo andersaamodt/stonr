@@ -446,10 +446,30 @@ mod tests {
                 .await
                 .unwrap();
         });
-        // give server a moment to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let url = format!("http://{}/healthz", addr);
-        let resp: super::Health = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        let resp: super::Health = {
+            let mut last_err = None;
+            let mut attempts = 0;
+            loop {
+                match reqwest::get(&url).await {
+                    Ok(resp) => break resp,
+                    Err(err) => {
+                        attempts += 1;
+                        if attempts >= 10 {
+                            panic!(
+                                "failed to fetch health endpoint after retries: {:?}",
+                                last_err
+                            );
+                        }
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+        .json()
+        .await
+        .unwrap();
         assert_eq!(resp.status, "ok");
         handle.await.unwrap();
     }
