@@ -38,6 +38,9 @@ stonr serve --env .env
 curl "http://localhost:7777/query?authors=npub1&kinds=1"
 ```
 
+Running any command will bootstrap `.env` with sensible defaults if it is missing,
+placing `stonr-data/` next to the config file.
+
 See [docs/api.md](docs/api.md) for HTTP and WebSocket details,
 [docs/mirroring.md](docs/mirroring.md) for mirroring setups, and
 [docs/onion.md](docs/onion.md) for Tor deployment.
@@ -69,6 +72,16 @@ FILTER_KINDS=1
 FILTER_SINCE_MODE=cursor
 ```
 
+## Mirroring upstream relays
+
+Set `RELAYS_UPSTREAM` to a comma-separated list of relay URLs in your `.env`
+file. Optional `FILTER_AUTHORS`, `FILTER_KINDS`, `FILTER_TAG_T`, and
+`FILTER_SINCE_MODE` values narrow the subscription. After updating the config,
+run `stonr serve --env .env` to connect and start ingesting mirrored events. You
+can also manage entries with `stonr mirror add <url>` (which verifies the relay
+before saving it) and `stonr mirror remove <url>`. See
+[docs/mirroring.md](docs/mirroring.md) for detailed examples.
+
 ## CLI
 
 ```
@@ -77,6 +90,8 @@ stonr ingest events/*.json
 stonr reindex --env .env
 stonr serve --env .env
 stonr verify --env .env --sample 1000
+stonr mirror add wss://relay.example
+stonr mirror remove wss://relay.example
 ```
 
 ## Build and Test
