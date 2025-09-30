@@ -21,7 +21,14 @@ use crate::mirror_config::{FilterConfig, RelayRequest};
 
 /// Command line interface entry point.
 #[derive(Parser)]
-#[command(name = "stonr", author, version, about = "File-backed Nostr relay")]
+#[command(
+    name = "stonr",
+    author,
+    version,
+    about = "File-backed Nostr relay",
+    after_help = MIRROR_SUBCOMMANDS_HELP,
+    after_long_help = MIRROR_SUBCOMMANDS_HELP
+)]
 struct Cli {
     /// Path to the `.env` configuration file.
     #[arg(long, default_value = ".env")]
@@ -30,6 +37,9 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
+
+const MIRROR_SUBCOMMANDS_HELP: &str = "\
+Mirror subcommands:\n    list                         List configured upstream relays and their requests\n    add-relay <URL>               Add a relay entry without any requests\n    remove-relay <URL>            Remove a relay and all of its requests\n    list-requests <URL>           List requests configured for a relay\n    add-request <URL> <NAME>      Create a new request on a relay\n    update-request <URL> <NAME>   Update an existing request\n    remove-request <URL> <NAME>   Remove a request from a relay\n\nFilter flags (for add-request/update-request):\n    --author <PUBKEY>             Repeatable author filters\n    --kind <KIND>                 Repeatable numeric kind filters\n    --tag <NAME=VALUE>            Repeatable #tag filters\n    --since <TIMESTAMP>           Lower UNIX timestamp bound\n    --until <TIMESTAMP>           Upper UNIX timestamp bound\n    --limit <COUNT>               Hint to limit the subscription size\n    --no-cursor                   Disable resume cursors for the request\n";
 
 /// Supported CLI subcommands.
 #[derive(Subcommand)]
@@ -52,6 +62,10 @@ enum Commands {
         sample: usize,
     },
     /// Manage upstream relay mirroring subscriptions.
+    #[command(
+        after_help = MIRROR_SUBCOMMANDS_HELP,
+        after_long_help = MIRROR_SUBCOMMANDS_HELP
+    )]
     Mirror {
         #[command(subcommand)]
         command: MirrorCommands,
@@ -266,10 +280,28 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(test, allow(dead_code))]
+fn rewrite_help_args<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
+    if let Some(idx) = args.iter().position(|arg| arg == "--help" || arg == "-h") {
+        if idx + 1 < args.len() && !args[idx + 1].starts_with('-') {
+            let mut rewritten = Vec::with_capacity(args.len());
+            rewritten.extend(args[..idx].iter().cloned());
+            rewritten.push("help".to_string());
+            rewritten.extend(args[idx + 1..].iter().cloned());
+            return rewritten;
+        }
+    }
+    args
+}
+
 #[cfg(not(test))]
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(rewrite_help_args(std::env::args()));
     run(cli).await
 }
 
